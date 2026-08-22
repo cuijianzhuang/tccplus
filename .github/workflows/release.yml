@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的版本号，例如 v1.0.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 构建并发布
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # package.sh 需要 tag 来算版本号
+
+      - name: 解析版本号
+        id: version
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$TAG"            >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}"    >> "$GITHUB_OUTPUT"
+
+      - name: 构建（通用二进制）
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: ./build.sh --universal
+
+      - name: 打包 DMG / ZIP
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: ./package.sh
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: TCC 权限助手 ${{ steps.version.outputs.tag }}
+          draft: false
+          generate_release_notes: true
+          files: |
+            dist/*.dmg
+            dist/*.zip
+            dist/SHA256SUMS
+          body: |
+            ## 安装
+
+            下载 `TCCHelper-${{ steps.version.outputs.version }}.dmg`，把应用拖进「应用程序」。
+
+            应用为 **ad-hoc 签名**，未经 Apple 公证，首次打开会被 Gatekeeper 拦下。右键点图标选「打开」，或执行：
+
+            ```bash
+            xattr -dr com.apple.quarantine "/Applications/TCC 权限助手.app"
+            ```
+
+            ## 权限
+
+            修改 TCC 数据库需要**完全磁盘访问**权限：系统设置 → 隐私与安全性 → 完全磁盘访问，把本应用加进去。
+
+            ## 校验
+
+            ```bash
+            shasum -a 256 -c SHA256SUMS
+            ```
+
+            通用二进制，支持 Apple Silicon 与 Intel，要求 macOS 13 及以上。

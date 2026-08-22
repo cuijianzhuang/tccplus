@@ -1,0 +1,6 @@
+build/
+dist/
+.DS_Store
+*.dSYM/
+# 官方 tccplus 二进制（自行放置，不入库）
+/tccplus

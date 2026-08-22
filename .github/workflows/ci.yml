@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: 构建（通用二进制）
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 显示工具链版本
+        run: swift --version
+
+      - name: 构建
+        run: ./build.sh --universal
+
+      - name: 校验产物
+        run: |
+          APP="build/TCC 权限助手.app"
+          test -x "$APP/Contents/MacOS/TCCHelper"
+          test -x "$APP/Contents/Resources/tccplus"
+          test -f "$APP/Contents/Resources/AppIcon.icns"
+          lipo -archs "$APP/Contents/MacOS/TCCHelper" | grep -q x86_64
+          lipo -archs "$APP/Contents/MacOS/TCCHelper" | grep -q arm64
+          "$APP/Contents/Resources/tccplus" --help
+          echo "产物检查通过"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: TCCHelper-app
+          path: build/TCC 权限助手.app
+          if-no-files-found: error
