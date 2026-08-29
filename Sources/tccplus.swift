@@ -6,6 +6,7 @@
 import Foundation
 import SQLite3
 import Security
+import SystemConfiguration
 
 let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
@@ -39,11 +40,36 @@ let systemScoped: Set<String> = [
     "kTCCServiceEndpointSecurityClient", "kTCCServiceScreenRecording",
 ]
 
+/// 解析「真正的用户」家目录。
+/// 提权运行时 NSHomeDirectory() 会变成 /var/root，用户级 TCC.db 并不在那里。
+func realUserHome() -> String {
+    let env = ProcessInfo.processInfo.environment
+
+    // 1. 调用方显式指定（GUI 提权执行时会传这个）
+    if let h = env["TCC_USER_HOME"], !h.isEmpty { return h }
+
+    // 2. sudo 保留的原始用户
+    if let u = env["SUDO_USER"], !u.isEmpty, u != "root", let home = homeDir(of: u) { return home }
+
+    // 3. 当前登录图形界面的用户（osascript 提权时走这条）
+    if let console = SCDynamicStoreCopyConsoleUser(nil, nil, nil) as String?,
+       !console.isEmpty, console != "root", console != "loginwindow",
+       let home = homeDir(of: console) { return home }
+
+    // 4. 本来就是普通用户运行
+    return NSHomeDirectory()
+}
+
+func homeDir(of user: String) -> String? {
+    guard let pw = getpwnam(user) else { return nil }
+    return String(cString: pw.pointee.pw_dir)
+}
+
 func dbPath(for service: String) -> String {
     if systemScoped.contains(service) {
         return "/Library/Application Support/com.apple.TCC/TCC.db"
     }
-    return (NSHomeDirectory() as NSString)
+    return (realUserHome() as NSString)
         .appendingPathComponent("Library/Application Support/com.apple.TCC/TCC.db")
 }
 
@@ -102,7 +128,13 @@ let client = args[2]
 let appPath: String? = args.count >= 4 ? args[3] : nil
 
 let path = dbPath(for: service)
-guard FileManager.default.fileExists(atPath: path) else { die("找不到 TCC 数据库: \(path)") }
+guard FileManager.default.fileExists(atPath: path) else {
+    die("""
+        找不到 TCC 数据库: \(path)
+        当前用户: \(NSUserName())  解析出的家目录: \(realUserHome())
+        提示: 提权运行时可用 TCC_USER_HOME 指定真实用户的家目录。
+        """)
+}
 let db = openDB(path)
 defer { sqlite3_close(db) }
 

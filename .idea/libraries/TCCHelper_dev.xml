@@ -1,0 +1,9 @@
+<component name="libraryTable">
+  <library name="TCCHelper-dev">
+    <CLASSES>
+      <root url="jar://$PROJECT_DIR$/dist/TCCHelper-dev.zip!/" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>

@@ -47,6 +47,11 @@ enum TCCAction: String, CaseIterable, Identifiable {
     }
 }
 
+/// 住在系统级 TCC.db 的服务，改它们需要 root；其余在用户级库，普通权限 + 完全磁盘访问即可
+let systemScopedServices: Set<String> = [
+    "ScreenCapture", "Accessibility", "ListenEvent", "SystemPolicyAllFiles",
+]
+
 let allServices: [TCCService] = [
     TCCService(id: "Microphone", title: "麦克风", symbol: "mic.fill", note: "kTCCServiceMicrophone"),
     TCCService(id: "Camera", title: "摄像头", symbol: "camera.fill", note: "kTCCServiceCamera"),
@@ -136,7 +141,8 @@ enum Runner {
         func q(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
         let tail = appPath.map { " " + q($0) } ?? ""
         let cmds = services.map { "\(q(tool)) \(action.rawValue) \(q($0)) \(q(bundleID))\(tail)" }
-        let shell = cmds.joined(separator: "; ")
+        // 提权后 NSHomeDirectory() 会变成 /var/root，显式传真实用户家目录
+        let shell = "export TCC_USER_HOME=\(q(NSHomeDirectory())); " + cmds.joined(separator: "; ")
         var log = "$ sudo sh -c \"\(shell)\"\n"
 
         let script = "do shell script \"" +
@@ -193,13 +199,17 @@ struct ContentView: View {
     @State private var target: TargetApp?
     @State private var selected: Set<String> = ["Microphone", "Camera"]
     @State private var action: TCCAction = .add
-    @State private var useAdmin = true
+    @State private var useAdmin = false
     @State private var showAdvanced = false
     @State private var log = ""
     @State private var running = false
     @State private var toolPath: String? = Runner.locateTCCPlus()
     @State private var showPicker = false
     @State private var dropTargeted = false
+
+    private var needsAdmin: Bool {
+        !selected.isDisjoint(with: systemScopedServices)
+    }
 
     private var canRun: Bool {
         target != nil && !selected.isEmpty && toolPath != nil && !running
@@ -222,6 +232,7 @@ struct ContentView: View {
             footer
         }
         .frame(minWidth: 620, minHeight: 640)
+        .onChange(of: selected) { _ in useAdmin = needsAdmin }
         .sheet(isPresented: $showPicker) {
             AppPickerSheet { url in
                 setTarget(url)
@@ -362,8 +373,12 @@ struct ContentView: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             Text(action.hint).font(.caption).foregroundStyle(.secondary)
-            Toggle("以管理员权限运行（写入系统 TCC 数据库时需要）", isOn: $useAdmin)
+            Toggle("以管理员权限运行", isOn: $useAdmin)
                 .toggleStyle(.checkbox).font(.caption)
+            Text(needsAdmin
+                 ? "已勾选的权限位于系统级数据库，必须提权。"
+                 : "所选权限都在用户级数据库，通常无需提权，但本工具需要「完全磁盘访问」。")
+                .font(.caption2).foregroundStyle(.secondary)
         }
     }
 
