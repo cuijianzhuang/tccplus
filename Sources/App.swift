@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import Security
 
 // MARK: - 数据模型
 
@@ -62,6 +63,119 @@ let allServices: [TCCService] = [
     TCCService(id: "AppleEvents", title: "自动化 (AppleEvents)", symbol: "gearshape.2.fill", note: "kTCCServiceAppleEvents"),
     TCCService(id: "Photos", title: "照片", symbol: "photo.fill", note: "kTCCServicePhotos"),
 ]
+
+
+// MARK: - 提权会话
+
+/// 持有一个 AuthorizationRef 并在整个 App 生命周期内复用。
+/// 系统对 system.privilege.admin 的授权有效期默认 5 分钟，期内再次执行不会重新弹框。
+final class AdminSession {
+    static let shared = AdminSession()
+    private init() {}
+
+    /// AuthorizationExecuteWithPrivileges 在 Swift 里被标为 unavailable，但符号仍在，运行时取指针
+    private typealias AEWP = @convention(c) (
+        AuthorizationRef, UnsafePointer<CChar>, AuthorizationFlags,
+        UnsafePointer<UnsafeMutablePointer<CChar>?>,
+        UnsafeMutablePointer<UnsafeMutablePointer<FILE>?>?
+    ) -> OSStatus
+
+    private static let execute: AEWP? = {
+        guard let handle = dlopen(nil, RTLD_NOW),
+              let sym = dlsym(handle, "AuthorizationExecuteWithPrivileges") else { return nil }
+        return unsafeBitCast(sym, to: AEWP.self)
+    }()
+
+    private var authRef: AuthorizationRef?
+    private(set) var authorizedAt: Date?
+
+    /// 系统默认的授权有效期
+    static let timeout: TimeInterval = 300
+
+    var isAvailable: Bool { Self.execute != nil }
+
+    var isAuthorized: Bool {
+        guard authRef != nil, let t = authorizedAt else { return false }
+        return Date().timeIntervalSince(t) < Self.timeout
+    }
+
+    var remaining: TimeInterval {
+        guard let t = authorizedAt else { return 0 }
+        return max(0, Self.timeout - Date().timeIntervalSince(t))
+    }
+
+    /// 取得（或续期）管理员授权。已在有效期内则直接返回，不弹框。
+    @discardableResult
+    func authorize() -> OSStatus {
+        if authRef == nil {
+            var ref: AuthorizationRef?
+            let st = AuthorizationCreate(nil, nil, [], &ref)
+            guard st == errAuthorizationSuccess else { return st }
+            authRef = ref
+        }
+        let name = strdup("system.privilege.admin")!
+        defer { free(name) }
+        var item = AuthorizationItem(name: name, valueLength: 0, value: nil, flags: 0)
+        var st: OSStatus = errAuthorizationInternal
+        withUnsafeMutablePointer(to: &item) { itemPtr in
+            var rights = AuthorizationRights(count: 1, items: itemPtr)
+            st = AuthorizationCopyRights(authRef!, &rights, nil,
+                                         [.interactionAllowed, .preAuthorize, .extendRights], nil)
+        }
+        if st == errAuthorizationSuccess { authorizedAt = Date() }
+        return st
+    }
+
+    /// 以 root 执行一段 shell，返回 (是否全部成功, 合并后的输出)
+    func run(shell: String) -> (ok: Bool, output: String)? {
+        guard let execute = Self.execute else { return nil }
+        let st = authorize()
+        guard st == errAuthorizationSuccess, let ref = authRef else {
+            return (false, st == errAuthorizationCanceled ? "已取消授权。\n" : "获取管理员授权失败 (\(st))\n")
+        }
+
+        // 用标记回传整体退出状态：AEWP 拿不到子进程的退出码
+        let marker = "__TCCPLUS_STATUS__"
+        let wrapped = "rc=0; " + shell + "; echo \"\(marker)$rc\""
+
+        var argv: [UnsafeMutablePointer<CChar>?] = [strdup("-c"), strdup(wrapped), nil]
+        defer { argv.forEach { free($0) } }
+
+        var filePipe: UnsafeMutablePointer<FILE>?
+        let status = argv.withUnsafeBufferPointer { buf in
+            execute(ref, "/bin/sh", [], buf.baseAddress!, &filePipe)
+        }
+        guard status == errAuthorizationSuccess else {
+            authorizedAt = nil
+            return (false, "提权执行失败 (\(status))\n")
+        }
+
+        var output = ""
+        if let f = filePipe {
+            var buf = [CChar](repeating: 0, count: 4096)
+            while fgets(&buf, Int32(buf.count), f) != nil { output += String(cString: buf) }
+            fclose(f)
+        }
+        // 回收子进程
+        var wstatus: Int32 = 0
+        while waitpid(-1, &wstatus, WNOHANG) > 0 {}
+
+        var ok = true
+        if let r = output.range(of: marker) {
+            let code = output[r.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+            ok = (code == "0")
+            output.removeSubrange(r.lowerBound..<output.endIndex)
+        }
+        return (ok, output)
+    }
+
+    /// 主动释放授权，下次执行会重新弹框
+    func invalidate() {
+        if let ref = authRef { AuthorizationFree(ref, [.destroyRights]) }
+        authRef = nil
+        authorizedAt = nil
+    }
+}
 
 // MARK: - tccplus 定位与执行
 
@@ -140,15 +254,24 @@ enum Runner {
     static func runAsAdmin(tool: String, action: TCCAction, services: [String], bundleID: String, appPath: String?) -> Result {
         func q(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
         let tail = appPath.map { " " + q($0) } ?? ""
-        let cmds = services.map { "\(q(tool)) \(action.rawValue) \(q($0)) \(q(bundleID))\(tail)" }
+        // 任一条失败就把 rc 置 1，但不中断后续命令（与非提权路径行为一致）
+        let cmds = services.map { "\(q(tool)) \(action.rawValue) \(q($0)) \(q(bundleID))\(tail) || rc=1" }
         // 提权后 NSHomeDirectory() 会变成 /var/root，显式传真实用户家目录
-        let shell = "export TCC_USER_HOME=\(q(NSHomeDirectory())); " + cmds.joined(separator: "; ")
+        let shell = "export TCC_USER_HOME=\(q(NSHomeDirectory())); " + cmds.joined(separator: "; ") + " 2>&1"
         var log = "$ sudo sh -c \"\(shell)\"\n"
 
+        // 首选：复用授权会话，5 分钟内不再弹框
+        if let r = AdminSession.shared.run(shell: shell) {
+            log += r.output
+            if !log.hasSuffix("\n") { log += "\n" }
+            return Result(ok: r.ok, log: log)
+        }
+
+        // 兜底：老路子，每次都会弹框
+        log += "（授权会话不可用，回退到 osascript）\n"
         let script = "do shell script \"" +
             shell.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") +
             "\" with administrator privileges"
-
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         p.arguments = ["-e", script]
@@ -206,6 +329,9 @@ struct ContentView: View {
     @State private var toolPath: String? = Runner.locateTCCPlus()
     @State private var showPicker = false
     @State private var dropTargeted = false
+    @State private var now = Date()
+
+    private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     private var needsAdmin: Bool {
         !selected.isDisjoint(with: systemScopedServices)
@@ -379,7 +505,33 @@ struct ContentView: View {
                  ? "已勾选的权限位于系统级数据库，必须提权。"
                  : "所选权限都在用户级数据库，通常无需提权，但本工具需要「完全磁盘访问」。")
                 .font(.caption2).foregroundStyle(.secondary)
+            if useAdmin { authStatus }
         }
+    }
+
+    /// 提权会话状态：授权在有效期内时显示倒计时，可主动释放
+    private var authStatus: some View {
+        let session = AdminSession.shared
+        return HStack(spacing: 6) {
+            if session.isAuthorized {
+                Image(systemName: "lock.open.fill").foregroundStyle(.green)
+                Text("已授权，\(Int(session.remaining.rounded())) 秒内免密")
+                Button("释放") {
+                    session.invalidate()
+                    now = Date()
+                }
+                .buttonStyle(.borderless)
+                .help("立即失效，下次执行重新验证")
+            } else {
+                Image(systemName: "lock.fill").foregroundStyle(.secondary)
+                Text(session.isAvailable ? "首次执行时验证一次，之后 5 分钟内免密"
+                                         : "授权会话不可用，每次执行都会弹框")
+            }
+            Spacer()
+        }
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+        .onReceive(ticker) { now = $0 }
     }
 
     private var logSection: some View {

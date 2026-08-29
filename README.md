@@ -70,8 +70,10 @@ open "build/TCC 权限助手.app"
 
 修改 TCC 数据库要求调用方拥有**完全磁盘访问**权限，这是系统限制，绕不过去：
 
-- 「以管理员权限运行」默认开启，会弹系统密码框（走 `osascript … with administrator privileges`）。
+- 「以管理员权限运行」会跟随勾选自动开关：只有屏幕录制、辅助功能、输入监控、完全磁盘访问位于系统级数据库、需要 root，其余在用户级库，有完全磁盘访问即可，不必提权。
+- 需要提权时只在**首次执行**验证一次密码，之后 5 分钟内免密——App 持有一个 `AuthorizationRef` 并复用（`system.privilege.admin` 的系统默认有效期）。界面会显示剩余秒数，可随时点「释放」立即失效。
 - 如果仍然失败，去 **系统设置 → 隐私与安全性 → 完全磁盘访问**，把 `TCC 权限助手.app` 加进去。
+- 提权执行走 `AuthorizationExecuteWithPrivileges`（该符号在 Swift 中被标为 unavailable，运行时用 `dlsym` 取指针调用）；取不到时自动回退到 `osascript … with administrator privileges`，那条路径每次都会弹框。
 - 少数受 SIP 保护的条目可能需要关闭 SIP —— 这是 TCC 本身的限制，不是本工具的。
 
 ## 内置的 tccplus
