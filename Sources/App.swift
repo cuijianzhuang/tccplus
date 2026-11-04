@@ -215,15 +215,37 @@ enum Runner {
 
     struct Result { let ok: Bool; let log: String }
 
-    /// 普通权限执行：逐条跑 tccplus <action> <service> <bundleID>
-    static func run(tool: String, action: TCCAction, services: [String], bundleID: String, appPath: String?) -> Result {
+    private static func appleEventsError(tool: String, services: [String], appPath: String?, target: TargetApp?) -> String? {
+        guard services.contains("AppleEvents") else { return nil }
+        guard tool == bundledPath else { return "AppleEvents 定向操作只能使用内置 tccplus，不能使用外部 CLI。\n" }
+        guard appPath != nil else { return "AppleEvents 定向操作缺少来源应用路径。\n" }
+        guard target != nil else { return "请先选择 AppleEvents 的目标应用。\n" }
+        return nil
+    }
+
+    private static func arguments(action: TCCAction, service: String, bundleID: String,
+                                  appPath: String?, appleEventsTarget: TargetApp?) -> [String] {
+        var argv = [action.rawValue, service, bundleID]
+        if let appPath { argv.append(appPath) }
+        if service == "AppleEvents", let target = appleEventsTarget {
+            argv += ["--target-bundle-id", target.bundleID, "--target-app-path", target.path]
+        }
+        return argv
+    }
+
+    /// 普通权限执行：逐条跑 tccplus
+    static func run(tool: String, action: TCCAction, services: [String], bundleID: String,
+                    appPath: String?, appleEventsTarget: TargetApp?) -> Result {
+        if let error = appleEventsError(tool: tool, services: services, appPath: appPath, target: appleEventsTarget) {
+            return Result(ok: false, log: error)
+        }
         var log = ""
         var ok = true
         for s in services {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: tool)
-            var argv = [action.rawValue, s, bundleID]
-            if let appPath { argv.append(appPath) }
+            let argv = arguments(action: action, service: s, bundleID: bundleID,
+                                 appPath: appPath, appleEventsTarget: appleEventsTarget)
             p.arguments = argv
             let out = Pipe(), err = Pipe()
             p.standardOutput = out
@@ -250,12 +272,19 @@ enum Runner {
         return Result(ok: ok, log: log)
     }
 
-    /// 管理员权限执行：拼成一条 shell 命令，交给 osascript 弹系统授权框
-    static func runAsAdmin(tool: String, action: TCCAction, services: [String], bundleID: String, appPath: String?) -> Result {
+    /// 管理员权限执行：拼成一条 shell 命令，交给授权会话或 osascript
+    static func runAsAdmin(tool: String, action: TCCAction, services: [String], bundleID: String,
+                           appPath: String?, appleEventsTarget: TargetApp?) -> Result {
+        if let error = appleEventsError(tool: tool, services: services, appPath: appPath, target: appleEventsTarget) {
+            return Result(ok: false, log: error)
+        }
         func q(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-        let tail = appPath.map { " " + q($0) } ?? ""
         // 任一条失败就把 rc 置 1，但不中断后续命令（与非提权路径行为一致）
-        let cmds = services.map { "\(q(tool)) \(action.rawValue) \(q($0)) \(q(bundleID))\(tail) || rc=1" }
+        let cmds = services.map { service in
+            let argv = arguments(action: action, service: service, bundleID: bundleID,
+                                 appPath: appPath, appleEventsTarget: appleEventsTarget)
+            return ([tool] + argv).map(q).joined(separator: " ") + " || rc=1"
+        }
         // 提权后 NSHomeDirectory() 会变成 /var/root，显式传真实用户家目录
         let shell = "export TCC_USER_HOME=\(q(NSHomeDirectory())); " + cmds.joined(separator: "; ") + " 2>&1"
         var log = "$ sudo sh -c \"\(shell)\"\n"
@@ -320,6 +349,7 @@ func scanInstalledApps() -> [InstalledApp] {
 
 struct ContentView: View {
     @State private var target: TargetApp?
+    @State private var appleEventsTarget: TargetApp?
     @State private var selected: Set<String> = ["Microphone", "Camera"]
     @State private var action: TCCAction = .add
     @State private var useAdmin = false
@@ -337,8 +367,15 @@ struct ContentView: View {
         !selected.isDisjoint(with: systemScopedServices)
     }
 
+    private var appleEventsWarning: String? {
+        guard selected.contains("AppleEvents") else { return nil }
+        guard appleEventsTarget != nil else { return "请先选择 AppleEvents 的目标应用。" }
+        guard toolPath == Runner.bundledPath else { return "AppleEvents 定向操作只能使用内置 tccplus，不能使用外部 CLI。" }
+        return nil
+    }
+
     private var canRun: Bool {
-        target != nil && !selected.isEmpty && toolPath != nil && !running
+        target != nil && !selected.isEmpty && toolPath != nil && appleEventsWarning == nil && !running
     }
 
     var body: some View {
@@ -349,6 +386,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 18) {
                     appSection
                     serviceSection
+                    if selected.contains("AppleEvents") { appleEventsTargetSection }
                     actionSection
                     if !log.isEmpty { logSection }
                 }
@@ -489,6 +527,42 @@ struct ContentView: View {
         }
     }
 
+    // AppleEvents 接收方
+    private var appleEventsTargetSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("AppleEvents 目标应用").font(.subheadline).bold()
+            HStack(spacing: 12) {
+                if let app = appleEventsTarget {
+                    Image(nsImage: NSWorkspace.shared.icon(forFile: app.path))
+                        .resizable().frame(width: 40, height: 40)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(app.name).bold()
+                        Text(app.bundleID).font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                        Text(app.path).font(.caption2).foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                } else {
+                    Text("尚未选择目标应用").foregroundStyle(.secondary)
+                }
+                Spacer()
+                VStack(spacing: 6) {
+                    Button("选择 Finder.app") {
+                        setAppleEventsTarget(URL(fileURLWithPath: "/System/Library/CoreServices/Finder.app"))
+                    }
+                    Button("选择其他应用…") { browseAppleEventsTarget() }
+                }
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .controlBackgroundColor)))
+            if let warning = appleEventsWarning {
+                Label(warning, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+        }
+    }
+
     // 动作
     private var actionSection: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -595,6 +669,25 @@ struct ContentView: View {
         if panel.runModal() == .OK, let url = panel.url { setTarget(url) }
     }
 
+    private func setAppleEventsTarget(_ url: URL) {
+        if let app = TargetApp.load(from: url) {
+            appleEventsTarget = app
+        } else {
+            appleEventsTarget = nil
+            log += "无法读取 AppleEvents 目标应用 \(url.path) 的 Bundle ID\n"
+        }
+    }
+
+    private func browseAppleEventsTarget() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.application]
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "选择目标应用"
+        if panel.runModal() == .OK, let url = panel.url { setAppleEventsTarget(url) }
+    }
+
     private func chooseTool() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
@@ -607,16 +700,23 @@ struct ContentView: View {
     }
 
     private func execute() {
-        guard let t = target, let tool = toolPath else { return }
+        guard let t = target, let tool = toolPath, !selected.isEmpty, !running else { return }
+        if let warning = appleEventsWarning {
+            log += warning + "\n"
+            return
+        }
         let services = allServices.map(\.id).filter { selected.contains($0) }
         let act = action
         let admin = useAdmin
+        let eventTarget = appleEventsTarget
         running = true
         DispatchQueue.global().async {
             let extra = (tool == Runner.bundledPath) ? t.path : nil
             let r = admin
-                ? Runner.runAsAdmin(tool: tool, action: act, services: services, bundleID: t.bundleID, appPath: extra)
-                : Runner.run(tool: tool, action: act, services: services, bundleID: t.bundleID, appPath: extra)
+                ? Runner.runAsAdmin(tool: tool, action: act, services: services, bundleID: t.bundleID,
+                                    appPath: extra, appleEventsTarget: eventTarget)
+                : Runner.run(tool: tool, action: act, services: services, bundleID: t.bundleID,
+                             appPath: extra, appleEventsTarget: eventTarget)
             DispatchQueue.main.async {
                 log += r.log
                 log += r.ok ? "✅ 完成。请退出并重新启动 \(t.name) 使其生效。\n\n"
